@@ -32,6 +32,51 @@ class Settings:
     worksheet_name: str
     columns: Sequence[str]
 
+    @staticmethod
+    def _resolve_path(value: str, base_dir: Path) -> Path:
+        path_value = Path(value)
+        return path_value if path_value.is_absolute() else (base_dir / path_value).resolve()
+
+    @classmethod
+    def from_values(
+        cls,
+        *,
+        excel_file_path: str,
+        service_account_file: str,
+        spreadsheet_id: str,
+        worksheet_name: str,
+        columns: Sequence[str] | None = None,
+        base_dir: Path | None = None,
+    ) -> "Settings":
+        base = base_dir or Path.cwd()
+        missing = [
+            name
+            for name, value in [
+                ("excel_file_path", excel_file_path),
+                ("service_account_file", service_account_file),
+                ("spreadsheet_id", spreadsheet_id),
+                ("worksheet_name", worksheet_name),
+            ]
+            if not value
+        ]
+        if missing:
+            raise RuntimeError(
+                "Missing required configuration values: "
+                f"{', '.join(missing)}."
+            )
+
+        column_list = []
+        if columns:
+            column_list = [col.strip() for col in columns if col and col.strip()]
+
+        return cls(
+            excel_file_path=cls._resolve_path(excel_file_path, base),
+            service_account_file=cls._resolve_path(service_account_file, base),
+            spreadsheet_id=spreadsheet_id,
+            worksheet_name=worksheet_name,
+            columns=tuple(column_list),
+        )
+
     @classmethod
     def from_env(cls) -> "Settings":
         project_root = Path(__file__).resolve().parents[1]
@@ -64,17 +109,14 @@ class Settings:
                 f"{', '.join(missing)}. Copy .env.example to .env and fill in values."
             )
 
-        columns = tuple(col.strip() for col in column_env.split(",") if col.strip())
-        return cls(
-            excel_file_path=(project_root / excel_file).resolve()
-            if not Path(excel_file).is_absolute()
-            else Path(excel_file),
-            service_account_file=(project_root / service_file).resolve()
-            if not Path(service_file).is_absolute()
-            else Path(service_file),
+        columns = [col.strip() for col in column_env.split(",") if col.strip()]
+        return cls.from_values(
+            excel_file_path=excel_file,
+            service_account_file=service_file,
             spreadsheet_id=spreadsheet_id,
             worksheet_name=worksheet_name,
             columns=columns,
+            base_dir=project_root,
         )
 
 
@@ -175,6 +217,22 @@ def upload_data(worksheet: gspread.Worksheet, rows: Sequence[Sequence[str]]) -> 
         start_row += len(chunk)
 
 
+def run_transfer(settings: Settings, *, dry_run: bool = False) -> None:
+    df = read_excel_data(settings)
+    value_matrix = build_value_matrix(df)
+
+    if dry_run:
+        logging.info("Dry run enabled; skipping Google Sheet updates.")
+        return
+
+    client = authenticate(settings)
+    worksheet = get_worksheet(client, settings.spreadsheet_id, settings.worksheet_name)
+
+    clear_worksheet(worksheet)
+    upload_data(worksheet, value_matrix)
+    logging.info("Data transfer completed successfully.")
+
+
 def main(argv: Sequence[str]) -> int:
     args = parse_args(argv)
     configure_logging(args.verbose)
@@ -182,19 +240,7 @@ def main(argv: Sequence[str]) -> int:
     try:
         settings = Settings.from_env()
         logging.debug("Loaded settings: %s", settings)
-        df = read_excel_data(settings)
-        value_matrix = build_value_matrix(df)
-
-        if args.dry_run:
-            logging.info("Dry run enabled; skipping Google Sheet updates.")
-            return 0
-
-        client = authenticate(settings)
-        worksheet = get_worksheet(client, settings.spreadsheet_id, settings.worksheet_name)
-
-        clear_worksheet(worksheet)
-        upload_data(worksheet, value_matrix)
-        logging.info("Data transfer completed successfully.")
+        run_transfer(settings, dry_run=args.dry_run)
         return 0
     except Exception as exc:  # noqa: BLE001
         logging.error("Automation failed: %s", exc, exc_info=args.verbose)
